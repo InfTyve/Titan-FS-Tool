@@ -38,17 +38,19 @@ ROM 模式说明
 新文件 > 原文件 → 追加到末尾，原 xattr 块一起搬过去，更新条目与头部字段
 """
 
-VERSION = "2026.11.03"
+VERSION = "2026.11.06"
 
 import os
 import io
 import sys
 import zlib
+import stat
 import bisect
 import argparse
 import struct
 import shutil
 import zipfile
+import time
 import hashlib
 import tempfile
 import subprocess
@@ -584,6 +586,459 @@ def cmd_extract(img, idx, out):
     return 0
 
 
+def _parse_layout(data, align, ino_first):
+    """按一种布局尝试解析，返回 (子项, 已消费字节)"""
+    out = []
+    p = 0
+    n = len(data)
+    while p + 12 <= n:
+        if ino_first:
+            ino = struct.unpack_from("<Q", data, p)[0]
+            nlen = struct.unpack_from("<I", data, p + 8)[0]
+            npos = p + 12
+        else:
+            nlen = struct.unpack_from("<I", data, p)[0]
+            npos = p + 4
+            if nlen < 2 or nlen > 255 or npos + nlen + 8 > n:
+                break
+            ino = struct.unpack_from("<Q", data, npos + nlen)[0]
+        if nlen < 2 or nlen > 255 or npos + nlen > n:
+            break
+        raw = data[npos:npos + nlen]
+        try:
+            name = raw.rstrip(b"\0").decode("utf-8")
+        except UnicodeDecodeError:
+            break
+        if not name or "\0" in name or any(ord(c) < 32 for c in name):
+            break
+        out.append((ino, name))
+        p = npos + nlen + (0 if ino_first else 8)
+        if align:
+            p = (p + (align - 1)) & ~(align - 1)
+    return out, p
+
+
+def parse_dirents_ex(data, align=4, ino_first=True):
+    """解析目录项数组，返回 (子项, 对齐, 已消费字节, 是否 inode 在前)
+
+    只读层里存在两种布局，必须都试：
+      ino_first=True   u64 子inode + u32 名长(含\\0) + 名字   （记录池 fscache.bin 的写法）
+      ino_first=False  u32 名长(含\\0) + 名字 + u64 子inode   （只读索引镜像 readonly.bin 的写法）
+    """
+    items, end = _parse_layout(data, align, ino_first)
+    return items, align, end, ino_first
+
+
+def pack_dirents(items, align=4, ino_first=True):
+    """按指定布局重新编码目录项数组"""
+    out = b""
+    for ino, name in items:
+        b = name.encode("utf-8") + b"\0"
+        if ino_first:
+            rec = struct.pack("<Q", ino) + struct.pack("<I", len(b)) + b
+        else:
+            rec = struct.pack("<I", len(b)) + b + struct.pack("<Q", ino)
+        if align:
+            rec += b"\0" * ((-len(rec)) % align)
+        out += rec
+    return out
+
+
+def dir_children(img, e):
+    """解析目录条目的子项，返回 (items, 对齐, 已消费字节, 是否 inode 在前)"""
+    if not isdir(e["mode"]) or not e["size"]:
+        return [], 4, 0, True
+    data = img.read(e)
+    best = None
+    for ino_first in (True, False):
+        for al in (4, 0):
+            got, end = _parse_layout(data, al, ino_first)
+            if not got:
+                continue
+            fit = 1 if end >= len(data) - 3 else 0
+            sane = 1 if all(0 <= i < img.count for i, _ in got) else 0
+            # 打平时优先 len+name+ino（readonly 索引镜像的实际布局）
+            score = (fit, sane, len(got), 0 if ino_first else 1)
+            if best is None or score > best[0]:
+                best = (score, got, al, end, ino_first)
+    if best is None:
+        return [], 4, 0, True
+    return best[1], best[2], best[3], best[4]
+
+
+def detect_layout(img, limit=4096):
+    """空目录没有数据可供判断，用分区内其它非空目录的布局作为默认值"""
+    for i in range(min(img.count, limit)):
+        e = img.entry(i)
+        if isdir(e["mode"]) and e["size"]:
+            items, al, _used, ino_first = dir_children(img, e)
+            if items:
+                return ino_first, al
+    return True, 4
+
+
+def resolve_path(img, path, root=0, quiet=False, trace=None):
+    """把 /system/app 这类路径解析成条目号，返回 (idx, 实际走过的路径)"""
+    segs = [s for s in path.replace("\\", "/").split("/") if s]
+    if not segs:
+        return root, "/"
+    idx = root
+    trail = ""
+    for seg in segs:
+        if not (0 <= idx < img.count):
+            raise ValueError("条目 %d 越界（共 %d 条），路径 %r 不可达" % (idx, img.count, path))
+        e = img.entry(idx)
+        if not isdir(e["mode"]):
+            raise ValueError("%r 指向 %s（条目 %d），不是目录"
+                             % (trail or "/", kind(e["mode"]), idx))
+        items = dir_children(img, e)[0]
+        cand = [t for t in items if t[1] == seg]
+        if not cand:
+            cand = [t for t in items if t[1].lower() == seg.lower()]
+            if cand and not quiet:
+                log("  [提示] %r 实际写作 %r" % (seg, cand[0][1]))
+        if not cand:
+            near = [t[1] for t in items][:12]
+            raise ValueError("目录 %r 里没有 %r%s"
+                             % (trail or "/", seg,
+                                "；现有子项：" + "、".join(near) if near else "（目录为空）"))
+        idx = cand[0][0]
+        trail += "/" + cand[0][1]
+        if trace is not None and 0 <= idx < img.count:
+            trace.append((trail, idx, img.entry(idx)))
+    return idx, trail
+
+
+def strip_part_prefix(img, path):
+    """只读层的根就是分区根，manifest 里的 /system/app 在镜像里是 /app"""
+    segs = [s for s in path.replace("\\", "/").split("/") if s]
+    if len(segs) < 2:
+        return ""
+    return "/" + "/".join(segs[1:])
+
+
+def locate_dir(img, val):
+    """父目录参数：纯数字当条目号，其余当路径。返回 (idx, 说明)"""
+    v = (val or "").strip()
+    if not v:
+        raise ValueError("父目录不能为空")
+    if v.isdigit():
+        i = int(v)
+        if not (0 <= i < img.count):
+            raise ValueError("条目 %d 越界（共 %d 条）" % (i, img.count))
+        e = img.entry(i)
+        if not isdir(e["mode"]):
+            raise ValueError("条目 %d 是 %s，不是目录" % (i, kind(e["mode"])))
+        return i, "条目 %d" % i
+    path = v if v.startswith("/") else "/" + v
+    try:
+        idx, trail = resolve_path(img, path, quiet=True)
+        return idx, "路径 %s" % trail
+    except ValueError as e1:
+        alt = strip_part_prefix(img, path)
+        if alt:
+            try:
+                idx, trail = resolve_path(img, alt, quiet=True)
+                log("  [提示] %s 不在层级里，按分区内路径 %s 解析（只读层的根就是该分区根）"
+                    % (path, trail))
+                return idx, "路径 %s" % trail
+            except ValueError as e2:
+                raise ValueError("路径不存在，两种解释都没命中：\n"
+                                 "         完整路径 %s：%s\n"
+                                 "         分区内   %s：%s\n"
+                                 "       只读层的根就是该分区根，所以 /system/app 在这里是 /app"
+                                 % (path, e1, alt, e2))
+        raise ValueError(str(e1))
+
+
+def cmd_path(img, path):
+    """只解析路径，打印每一层和最终目录的子项"""
+    p = path if path.startswith("/") else "/" + path
+    log("[解析] %s" % p)
+    trace = []
+    try:
+        idx, trail = resolve_path(img, p, quiet=True, trace=trace)
+    except ValueError as e1:
+        alt = strip_part_prefix(img, p)
+        if not alt:
+            log("[错误] %s" % e1)
+            return 1
+        log("  [提示] %s 不在层级里，按分区内路径 %s 解析（只读层的根就是该分区根）" % (p, alt))
+        trace = []
+        try:
+            idx, trail = resolve_path(img, alt, quiet=True, trace=trace)
+        except ValueError as e2:
+            log("[错误] 路径不存在，两种解释都没命中：")
+            log("         完整路径 %s：%s" % (p, e1))
+            log("         分区内   %s：%s" % (alt, e2))
+            return 1
+    for t, ino, ch in trace:
+        log("  %-32s -> 条目 %-5d %s  %s" % (t, ino, stat.filemode(ch["mode"]), human(ch["size"])))
+    e = img.entry(idx)
+    if not isdir(e["mode"]):
+        log("")
+        log("最终是文件，不是目录（%s，条目 %d）。" % (human(e["size"]), idx))
+        log("要替换它：ropatch.py <镜像> replace --part <分区> %d <新文件> --yes" % idx)
+        return 0
+    items = dir_children(img, e)[0]
+    log("")
+    log("目录 %s = 条目 %d，子项 %d 个：" % (trail or "/", idx, len(items)))
+    for ino, nm in items[:30]:
+        ch = img.entry(ino) if 0 <= ino < img.count else None
+        mark = "" if ch is None or not isdir(ch["mode"]) else "/"
+        log("  %-36s ino=%-6d %s" % (nm + mark, ino, stat.filemode(ch["mode"]) if ch else "?"))
+    if len(items) > 30:
+        log("  ... 另有 %d 个" % (len(items) - 30))
+    log("")
+    log("下一步：ropatch.py <镜像> add --part <分区> %s <文件名> <本地文件> --yes" % (trail or "/"))
+    return 0
+
+
+def cmd_tree(img, path, depth, limit):
+    """打印目录树（只读层没有名字索引，只能逐层解析）"""
+    try:
+        idx, trail = locate_dir(img, path or "/")
+    except ValueError as e:
+        log("[错误] %s" % e)
+        return 2
+    log("%s  (条目 %d)" % (trail or "/", idx))
+    seen = set()
+
+    def walk(i, prefix, d):
+        if d >= depth or i in seen:
+            return 0
+        seen.add(i)
+        e = img.entry(i)
+        items = dir_children(img, e)[0]
+        if len(items) > limit:
+            shown = items[:limit]
+        else:
+            shown = items
+        n = 0
+        for k, (ino, nm) in enumerate(shown):
+            last = (k == len(shown) - 1) and len(items) <= limit
+            ch = img.entry(ino) if 0 <= ino < img.count else None
+            if ch is None:
+                log("%s%s%s  [缺失 inode %d]" % (prefix, "└─ " if last else "├─ ", nm, ino))
+                continue
+            enc = "目录" if isdir(ch["mode"]) else human(ch["size"])
+            log("%s%s%s  (%s, ino=%d)" % (prefix, "└─ " if last else "├─ ", nm, enc, ino))
+            n += 1
+            if isdir(ch["mode"]):
+                n += walk(ino, prefix + ("   " if last else "│  "), d + 1)
+        if len(items) > limit:
+            log("%s└─ ... 另有 %d 项（--limit 放宽）" % (prefix, len(items) - limit))
+        return n
+
+    total = walk(idx, "", 0)
+    log("")
+    log("共 %d 项（深度上限 %d）" % (total, depth))
+    return 0
+
+
+def cmd_show(img, idx, limit, maxx):
+    """完整展示一个条目：权限、时间、crc、xattr 十六进制、目录子项"""
+    e = img.entry(idx)
+    log("条目 %d" % idx)
+    log("  类型    : %s" % kind(e["mode"]))
+    log("  权限    : %s  (mode=%#o)" % (stat.filemode(e["mode"]), e["mode"]))
+    log("  uid/gid : %d / %d   nlink=%d" % (e["uid"], e["gid"], e["nlink"]))
+    log("  大小    : %s" % human(e["size"]))
+    log("  偏移    : %#x" % e["off"])
+    log("  crc32   : %08x" % e["crc"])
+    log("  flag    : %#x" % e["flag"])
+    log("  mtime   : %d   ctime: %d" % (e["mtime"], e["ctime"]))
+    log("  xattr   : %d 字节" % e["mlen"])
+    xb = img.xattr(e)
+    if xb:
+        prev = None
+        for i in range(0, min(len(xb), maxx), 16):
+            chunk = xb[i:i + 16]
+            hexs = " ".join("%02x" % b for b in chunk)
+            txt = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            log("    %04x  %-47s  |%s|" % (i, hexs, txt))
+            prev = i
+        if len(xb) > maxx:
+            log("    ... 共 %d 字节，只显示前 %d" % (len(xb), maxx))
+        elif prev is not None:
+            log("    （完整 xattr 块 %d 字节）" % len(xb))
+    if isdir(e["mode"]) and e["size"]:
+        data = img.read(e)
+        got, al, used, ino_first = dir_children(img, e)
+        layout = "ino+len+name" if ino_first else "len+name+ino"
+        log("  子项    : %d 个（数据区 %d 字节，已解析 %d，布局 %s，对齐 %d）"
+            % (len(got), len(data), used, layout, al))
+        for ino, name in got[:limit]:
+            log("    %-40s ino=%d" % (name, ino))
+        if len(got) > limit:
+            log("    ... 另有 %d 个，用 --limit 放宽" % (len(got) - limit))
+        if not got:
+            log("    （解析不出目录项，可能是别的编码，用 extract 导出后手工看）")
+    return 0
+
+
+def cmd_add(img, diridx, name, newfile, yes, backup, xattr_from):
+    """往某个目录里挂一个新文件。会重写整个容器：条目表 +1，数据区整体后移。"""
+    if not name or "/" in name or name in (".", ".."):
+        log("[错误] 文件名非法：%r" % name)
+        return 2
+    d = img.entry(diridx)
+    if not isdir(d["mode"]):
+        log("[错误] 条目 %d 是 %s，不是目录" % (diridx, kind(d["mode"])))
+        return 2
+    try:
+        fsize = os.path.getsize(newfile)
+    except OSError as e:
+        log("[错误] 读不到 %s：%s" % (newfile, e))
+        return 2
+
+    old = img.read(d) if d["size"] else b""
+    items, al, used, ino_first = dir_children(img, d)
+    if not items and not d["size"]:
+        ino_first, al = detect_layout(img)
+        log("  [推断] 目标目录为空，沿用分区内其它目录的布局 %s，对齐 %d"
+            % ("ino+len+name" if ino_first else "len+name+ino", al))
+    for ino, nm in items:
+        if nm == name:
+            log("[错误] 目录里已经有 %r（条目 %d），替换请用 replace" % (name, ino))
+            return 2
+
+    complete = (used >= len(old) - 3)
+    ordered = all(items[k][1] <= items[k + 1][1] for k in range(len(items) - 1))
+    newino = img.count
+    if complete and ordered:
+        merged = sorted(items + [(newino, name)], key=lambda t: t[1])
+        newdir = pack_dirents(merged, al, ino_first)
+        how = "保持有序，按名字插入"
+    else:
+        newdir = old + pack_dirents([(newino, name)], al, ino_first)
+        how = "原目录项无法完整解析或无排序，追加到末尾"
+
+    crc_new = 0
+    with open(newfile, "rb") as nf:
+        while True:
+            b = nf.read(CHUNK)
+            if not b:
+                break
+            crc_new = zlib.crc32(b, crc_new)
+    crc_new &= 0xFFFFFFFF
+
+    xb_dir = img.xattr(d)
+    tpl = img.entry(xattr_from) if xattr_from >= 0 else None
+    xb_new = img.xattr(tpl) if tpl is not None else xb_dir
+
+    esz = img.esz
+    old_start = img.hdr_len + img.count * esz
+    end = img.used_end or img.size
+    remain = max(0, min(end, img.size) - old_start)
+    dir_off = end + esz
+    file_off = dir_off + len(newdir) + len(xb_dir)
+    used_end = file_off + fsize + len(xb_new)
+    grow = used_end - img.size
+
+    log("目标目录 : 条目 %d  %s  子项 %d 个，数据 %s"
+        % (diridx, stat.filemode(d["mode"]), len(items), human(len(old))))
+    log("新条目   : 条目 %d  %s  (%s)" % (newino, name, human(fsize)))
+    log("目录项   : %d -> %d 个，数据 %s -> %s（%s）"
+        % (len(items), len(items) + 1, human(len(old)), human(len(newdir)), how))
+    log("          布局 %s，对齐 %d，已解析 %d/%d 字节"
+        % ("ino+len+name" if ino_first else "len+name+ino", al, used, len(old)))
+    log("条目表   : 条目表 %d -> %d 项（数据区整体后移 %d B）"
+        % (img.count, img.count + 1, esz))
+    log("         : 父目录数据 -> %#x，新文件 -> %#x" % (dir_off, file_off))
+    log("容器     : %s -> %s（+%s）" % (human(img.size), human(used_end), human(grow)))
+    log("xattr    : 新文件 %d 字节（%s）"
+        % (len(xb_new), "来自条目 %d" % xattr_from if tpl else "复制父目录"))
+    fsc = os.path.join(os.path.dirname(img.path), "fscache.bin")
+    if os.path.exists(fsc):
+        log("[注意]   同分区还有 fscache.bin（%s）"
+            % human(os.path.getsize(fsc)))
+        log("         它是 inode 记录池，可能是元数据的权威来源；本工具只改 readonly.bin，")
+        log("         若导入后新文件不可见，需要再同步记录池（或改用引擎自己建目录的方式）。")
+    if not yes:
+        log("")
+        log("[演练] 未写入。加 --yes 真正执行（会写一个 %s 的临时文件再原子替换）"
+            % human(used_end))
+        return 0
+
+    if backup:
+        bak = img.path + ".bak"
+        log("备份 -> %s" % bak)
+        shutil.copy2(img.path, bak)
+
+    table = bytearray((img.count + 1) * esz)
+    for i in range(img.count):
+        o = img.entry_off(i)
+        table[i * esz:(i + 1) * esz] = img.head[o:o + esz]
+    for i in range(img.count):
+        off = struct.unpack_from("<I", table, i * esz + 40)[0]
+        if off:
+            struct.pack_into("<I", table, i * esz + 40, off + esz)
+    struct.pack_into("<I", table, diridx * esz + 36, len(newdir))
+    struct.pack_into("<I", table, diridx * esz + 40, dir_off)
+    struct.pack_into("<I", table, diridx * esz + 44, zlib.crc32(newdir) & 0xFFFFFFFF)
+
+    now = int(time.time())
+    uid, gid = (tpl["uid"], tpl["gid"]) if tpl else (d["uid"], d["gid"])
+    o = img.count * esz
+    struct.pack_into("<IIII", table, o, 0o100644, uid, gid, 1)
+    struct.pack_into("<IIII", table, o + 16, now, 0, now, 0)
+    struct.pack_into("<IIIII", table, o + 32, 0x50000000, fsize, file_off, crc_new, len(xb_new))
+
+    hdr = bytearray(img.head[:img.hdr_len])
+    struct.pack_into("<I", hdr, 8, img.count + 1)
+    struct.pack_into("<I", hdr, 12, used_end)
+    struct.pack_into("<I", hdr, 16, file_off)
+
+    tmp = img.path + ".newadd"
+    written = 0
+    try:
+        with open(img.path, "rb") as src, open(tmp, "wb") as dst:
+            dst.write(hdr)
+            dst.write(table)
+            written = len(hdr) + len(table)
+            src.seek(old_start)
+            left = remain
+            while left > 0:
+                b = src.read(min(CHUNK, left))
+                if not b:
+                    break
+                dst.write(b)
+                written += len(b)
+                left -= len(b)
+            dst.write(newdir)
+            dst.write(xb_dir)
+            written += len(newdir) + len(xb_dir)
+            with open(newfile, "rb") as nf:
+                while True:
+                    b = nf.read(CHUNK)
+                    if not b:
+                        break
+                    dst.write(b)
+                    written += len(b)
+            dst.write(xb_new)
+            written += len(xb_new)
+        if written != used_end:
+            log("[错误] 写出的长度 %d 与预期 %d 不符，已放弃" % (written, used_end))
+            os.unlink(tmp)
+            return 2
+        os.replace(tmp, img.path)
+    except OSError as e:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        log("[错误] 写入失败：%s" % e)
+        return 2
+
+    log("")
+    log("✓ 已追加条目 %d（%s）到条目 %d" % (newino, name, diridx))
+    log("  新文件大小 %s，容器 %s" % (human(fsize), human(os.path.getsize(img.path))))
+    log("  建议复验：ropatch.py <镜像> show --part <分区> %d" % diridx)
+    return 0
+
+
 def cmd_replace(img, idx, newfile, yes, backup, align):
     e = img.entry(idx)
     if isdir(e["mode"]):
@@ -686,8 +1141,12 @@ def main():
             "  python3 ropatch.py fs.7z info",
             "  python3 ropatch.py fs.7z info --part system",
             "  python3 ropatch.py fs.7z apks --part system --pkg com.android.settings",
+            "  python3 ropatch.py fs.7z tree --part system / --depth 2",
+            "  python3 ropatch.py fs.7z path --part system /system/app",
+            "  python3 ropatch.py fs.7z show --part system 1234",
             "  python3 ropatch.py fs.7z find --part system com.android.settings",
             "  python3 ropatch.py fs.7z replace --part system 123 改好的.apk --yes",
+            "  python3 ropatch.py fs.7z add --part system /system/app NewApp.apk ./NewApp.apk --yes",
             "  python3 ropatch.py fs.7z verify --part system"]))
     sub = ap.add_subparsers(dest="cmd")
 
@@ -717,6 +1176,36 @@ def main():
     p.add_argument("idx", type=int)
     p.add_argument("-o", "--out", default="")
 
+    p = sub.add_parser("show", parents=[common],
+                       help="完整展示一个条目：权限、时间、xattr、目录子项")
+    p.add_argument("image")
+    p.add_argument("idx", type=int)
+    p.add_argument("--limit", type=int, default=50, help="目录子项最多显示多少个")
+    p.add_argument("--xattr-bytes", type=int, default=512, help="xattr 十六进制最多显示多少字节")
+
+    p = sub.add_parser("path", parents=[common],
+                       help="把 /system/app 这类路径解析成条目号")
+    p.add_argument("image")
+    p.add_argument("path")
+
+    p = sub.add_parser("tree", parents=[common],
+                       help="打印目录树（逐层解析目录项）")
+    p.add_argument("image")
+    p.add_argument("path", nargs="?", default="/")
+    p.add_argument("--depth", type=int, default=2, help="最大深度，默认 2")
+    p.add_argument("--limit", type=int, default=40, help="每层最多显示多少项")
+
+    p = sub.add_parser("add", parents=[common],
+                       help="在某个目录下新增一个文件条目（重写整个容器）")
+    p.add_argument("image")
+    p.add_argument("dir", help="父目录：条目号（如 12）或路径（如 /system/app）")
+    p.add_argument("name", help="新文件名，如 NewApp.apk")
+    p.add_argument("file", help="要写入的内容文件")
+    p.add_argument("--yes", action="store_true", help="真的写入")
+    p.add_argument("--backup", action="store_true", help="写前整文件备份为 .bak（ROM 模式不适用）")
+    p.add_argument("--xattr-from", type=int, default=-1,
+                   help="从该条目复制 xattr 块，默认用父目录的")
+
     p = sub.add_parser("replace", parents=[common], help="替换某个条目的内容")
     p.add_argument("image")
     p.add_argument("idx", type=int)
@@ -731,11 +1220,20 @@ def main():
 
     ap.add_argument("--version", action="version", version="ropatch " + VERSION)
     # 允许 "ropatch.py fs.7z info" 这种写法：把开头的镜像路径挪到子命令参数末尾
-    CMDS = ("info", "list", "find", "apks", "extract", "replace", "verify")
+    CMDS = ("info", "list", "find", "apks", "path", "tree", "show",
+            "extract", "add", "replace", "verify")
     argv = sys.argv[1:]
     if argv and argv[0] not in CMDS and not argv[0].startswith("-"):
         argv = [argv[1], argv[0]] + argv[2:]
-    args = ap.parse_args(argv)
+    # argparse 对 "nargs='?' 的 positional 出现在 optional 之后" 有已知缺陷：
+    # tree --part system / 会把 "/" 丢进 extras，这里补回来。
+    args, extra = ap.parse_known_args(argv)
+    if extra and getattr(args, "cmd", "") in ("tree", "path") \
+            and len(extra) == 1 and not extra[0].startswith("-"):
+        args.path = extra[0]
+        extra = []
+    if extra:
+        ap.error("unrecognized arguments: %s" % " ".join(extra))
     if not args.cmd:
         ap.print_help()
         return 2
@@ -767,8 +1265,28 @@ def main():
             rc = cmd_apks(img, parse_size(args.min_size, 1 << 20),
                           parse_size(args.max_probe, 128 << 20),
                           args.pkg.strip(), args.limit)
+        elif args.cmd == "show":
+            rc = cmd_show(img, args.idx, args.limit, args.xattr_bytes)
+        elif args.cmd == "path":
+            rc = cmd_path(img, args.path)
+        elif args.cmd == "tree":
+            rc = cmd_tree(img, args.path, args.depth, args.limit)
         elif args.cmd == "extract":
             rc = cmd_extract(img, args.idx, args.out)
+        elif args.cmd == "add":
+            try:
+                diridx, label = locate_dir(img, args.dir)
+            except ValueError as e:
+                log("[错误] 找不到目标目录：%s" % e)
+                log("       先用 tree 看一眼：ropatch.py <镜像> tree --part %s --depth 2"
+                    % (args.part or "<分区>"))
+                rc = 2
+            else:
+                log("解析目录 : %s = 条目 %d" % (label, diridx))
+                rc = cmd_add(img, diridx, args.name, args.file, args.yes,
+                             args.backup and not rom, args.xattr_from)
+                if rom and rc == 0 and args.yes:
+                    rom.mark(member)
         elif args.cmd == "replace":
             rc = cmd_replace(img, args.idx, args.newfile, args.yes,
                              args.backup and not rom, args.align)

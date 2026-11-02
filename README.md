@@ -351,6 +351,13 @@ python3 ropatch.py fs.7z find --part system "some-text"         # 明文搜索
 python3 ropatch.py fs.7z extract --part system 123 -o old.apk   # 导出某条目
 python3 ropatch.py fs.7z replace --part system 123 改好的.apk --yes
 python3 ropatch.py fs.7z verify --part system                   # 全量 CRC 复验
+python3 ropatch.py fs.7z tree --part system / --depth 2
+python3 ropatch.py fs.7z path --part system /system/app
+python3 ropatch.py fs.7z add --part system /system/app NewApp.apk ./NewApp.apk
+python3 ropatch.py fs.7z add --part system /system/app NewApp.apk ./NewApp.apk --yes
+python3 ropatch.py fs.7z verify --part system
+python3 titanunpack.py fs.7z -o /tmp/chk --list
+
 ```
 
 ### 子命令
