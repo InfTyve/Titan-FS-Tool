@@ -26,7 +26,7 @@ titanunpack.py —— VPhoneGaga / 虚拟大师 "Titan FS" 一键解包器
     （没有 py7zr 时，若系统装有 7z/7za 会自动改用命令行）
 """
 
-VERSION = "2026.11.01"
+VERSION = "2026.11.03"
 
 import io
 import os
@@ -407,12 +407,22 @@ class Node:
 
     def read(self, limit=None):
         n = self.size if limit is None else min(self.size, limit)
-        if isinstance(self.src, bytes):
-            return self.src[:n]
+        if isinstance(self.src, (bytes, bytearray)):
+            return bytes(self.src[:n])
         if isinstance(self.src, tuple):
             buf, off, size = self.src
             n = min(n, size)
-            return bytes(buf[off:off + n])
+            if isinstance(buf, (bytes, bytearray, memoryview)):
+                return bytes(buf[off:off + n])
+            # buf 是文件路径（普通桶分区）：按需读，避免把整个文件读进内存
+            if isinstance(buf, str):
+                try:
+                    with open(buf, "rb") as f:
+                        f.seek(off)
+                        return f.read(n)
+                except OSError:
+                    return b""
+            return b""
         return b""
 
 
@@ -1078,6 +1088,8 @@ def main():
     ap.add_argument("--no-raw", action="store_true", help="解压后删除 raw/ 原始内容")
     ap.add_argument("--no-merge", action="store_true", help="不生成 merged/ 合并视图")
     ap.add_argument("--keep-meta", action="store_true", help="保留 .metadata 等原始文件到 raw/")
+    ap.add_argument("--fresh", action="store_true",
+                    help="丢弃 raw/ 与旧输出，强制重新解压（默认会比对归档大小/时间，变了自动重解）")
     ap.add_argument("--links", default="materialize",
                     choices=["materialize", "native", "skip"],
                     help="符号链接策略：materialize=复制成真实文件(默认，不产生符号链接)；"
@@ -1098,14 +1110,47 @@ def main():
     log("输出: %s" % outdir)
 
     raw = os.path.join(outdir, "raw")
+    stamp = os.path.join(outdir, ".archive.stamp")
     if os.path.isdir(src):
         log("[1/4] 输入为目录，跳过解压")
         workroot = src
     else:
+        sig = "%s|%d|%d" % (os.path.basename(src), os.path.getsize(src),
+                            int(os.path.getmtime(src)))
+        old = ""
+        if os.path.exists(stamp):
+            try:
+                old = open(stamp, encoding="utf-8").read().strip()
+            except OSError:
+                old = ""
+        reuse = False
         if os.path.isdir(raw) and os.listdir(raw):
-            log("[1/4] 复用已有 raw/（如需重解压请先删除）")
-        elif not unpack(src, raw):
+            if args.fresh:
+                log("[1/4] --fresh：丢弃旧 raw/ 与旧输出，重新解压")
+                shutil.rmtree(raw, ignore_errors=True)
+                for sub in ("by-partition", "merged", "vm1", "vm2", "vm3"):
+                    p = os.path.join(outdir, sub)
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+            elif old and old != sig:
+                log("[1/4] 归档已变化，丢弃旧 raw/ 重新解压")
+                log("      %s" % (old or "（无记录）"))
+                log("   -> %s" % sig)
+                shutil.rmtree(raw, ignore_errors=True)
+            elif not old:
+                log("[1/4] raw/ 存在但无归档指纹，按旧行为复用（--fresh 强制重解）")
+                reuse = True
+            else:
+                log("[1/4] 复用已有 raw/（归档未变）")
+                reuse = True
+        if not reuse and not unpack(src, raw):
             return 2
+        if not reuse:
+            try:
+                with open(stamp, "w", encoding="utf-8") as f:
+                    f.write(sig)
+            except OSError:
+                pass
         workroot = raw
 
     roots = find_fs_roots(workroot)
